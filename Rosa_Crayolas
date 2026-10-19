@@ -1,0 +1,431 @@
+/*
+ * ROSA INTERCALADA POR ETAPA: CRAYOLA DIRECTA EN COLOR + FLORIOGRAFIA EN BLANCO
+ * Compilacion: g++ -std=c++17 -O2 main.cpp -o rosa
+ */
+#include <iostream>
+#include <vector>
+#include <string>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <unistd.h>
+
+// ============================================================================
+// CONFIGURACION DE PANTALLA Y POSICION HORIZONTAL
+// ============================================================================
+#define WIDTH       180
+#define HEIGHT      39
+
+// Desplazamiento hacia la derecha para centrar en OnlineGDB
+static const float OFFSET_X = 50.0f;
+
+// ============================================================================
+// TEXTURAS ABSTRACTAS DE CRAYON (Entran directo en verde o rojo, SIN blanco)
+// ============================================================================
+static const char* TRAZOS_CRAYON[6] = {
+    u8"░░░░▒▒▓▓▒▒░░░░",
+    u8"▒▒▓▓████▓▓▒▒",
+    u8"░░▒▒▓▓▒▒░░",
+    u8"〰〰▒▒▓▓▒▒〰〰",
+    u8"░░▒▒▓▓▓▓▒▒░░",
+    u8"▒▒░░▓▓▓▓░░▒▒"
+};
+
+// ============================================================================
+// FLORIOGRAFIA DE LA ROSA EN 12 IDIOMAS (Entran en BLANCO y pasan a su color)
+// ============================================================================
+static const char* WORDS[12] = {
+    u8"True passion",    // Ingles    - Rosa Roja: Pasion verdadera
+    u8"Amor eterno",     // Espanol   - Rosa Carmesi: Amor inmortal
+    u8"Beauté pure",     // Frances   - Rosa de Damasco: Belleza pura
+    u8"Reine Hingabe",   // Aleman    - Rosa Silvestre: Devocion pura
+    u8"Dolce grazia",    // Italiano  - Rosa Centifolia: Dulce gracia
+    u8"Derin tutku",     // Turco     - Rosa Oscura: Pasion profunda
+    u8"Wagas na puso",   // Tagalo    - Capullo de Rosa: Corazon puro
+    u8"영원한 열정",       // Coreano   - Rosa sin Espinas: Pasion eterna
+    u8"Алая страсть",    // Ruso      - Rosa Borgona: Pasion escarlata
+    u8"挚爱永恒",          // Chino     - Rosa Rugosa: Amor sincero y eterno
+    u8"Doce desejo",     // Portugues - Rosa Coral: Dulce deseo
+    u8"情熱と愛"           // Japones   - Hanakotoba: Pasion y amor
+};
+
+// ============================================================================
+// GENERADOR ALEATORIO Y SELECTORES
+// ============================================================================
+static std::mt19937 g_rng(std::random_device{}());
+
+inline float rand_range(float min_val, float max_val) {
+    return std::uniform_real_distribution<float>(min_val, max_val)(g_rng);
+}
+
+static std::vector<int> g_cola_idiomas;
+static std::vector<int> g_cola_crayones;
+
+static const char* siguiente_frase() {
+    if (g_cola_idiomas.empty()) {
+        for (int i = 0; i < 12; i++) g_cola_idiomas.push_back(i);
+        std::shuffle(g_cola_idiomas.begin(), g_cola_idiomas.end(), g_rng);
+    }
+    int idx = g_cola_idiomas.back();
+    g_cola_idiomas.pop_back();
+    return WORDS[idx];
+}
+
+static const char* siguiente_crayon() {
+    if (g_cola_crayones.empty()) {
+        for (int i = 0; i < 6; i++) g_cola_crayones.push_back(i);
+        std::shuffle(g_cola_crayones.begin(), g_cola_crayones.end(), g_rng);
+    }
+    int idx = g_cola_crayones.back();
+    g_cola_crayones.pop_back();
+    return TRAZOS_CRAYON[idx];
+}
+
+// ============================================================================
+// LECTOR UTF-8 (Distingue bloques ░▒▓█ de 1 col y caracteres CJK/〰 de 2 cols)
+// ============================================================================
+struct Glyph {
+    std::string ch;
+    int width;
+};
+
+static std::vector<Glyph> separar_glifos_utf8(const char* s) {
+    std::vector<Glyph> res;
+    int i = 0;
+    while (s[i] != '\0') {
+        unsigned char c = (unsigned char)s[i];
+        int len = 1;
+        int w = 1;
+        if ((c & 0x80) == 0) {
+            len = 1; w = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2; w = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            w = (c == 0xE2) ? 1 : 2; // ░▒▓█ ocupan 1 col; CJK y 〰 ocupan 2 cols
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4; w = 2;
+        }
+        res.push_back({std::string(s + i, len), w});
+        i += len;
+    }
+    return res;
+}
+
+// ============================================================================
+// BUFFER DE PANTALLA
+// ============================================================================
+struct Pixel {
+    std::string text;
+    int width;
+    bool is_continuation;
+    unsigned char r, g, b;
+    bool colored;
+    bool flash_white;
+    bool is_text_layer;
+    int layer;
+};
+
+static Pixel screen_buffer[HEIGHT][WIDTH];
+
+static void clear_screen_buffer() {
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            screen_buffer[y][x] = {" ", 1, false, 0, 0, 0, false, false, false, -1};
+        }
+    }
+}
+
+static void apagar_destellos_previos() {
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            screen_buffer[y][x].flash_white = false;
+        }
+    }
+}
+
+static void limpiar_colision_ancha(int x, int y) {
+    if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return;
+    if (screen_buffer[y][x].is_continuation && x - 1 >= 0) {
+        screen_buffer[y][x - 1].text = " ";
+        screen_buffer[y][x - 1].width = 1;
+    }
+    if (screen_buffer[y][x].width == 2 && x + 1 < WIDTH) {
+        screen_buffer[y][x + 1].text = " ";
+        screen_buffer[y][x + 1].width = 1;
+        screen_buffer[y][x + 1].is_continuation = false;
+    }
+    screen_buffer[y][x].is_continuation = false;
+    screen_buffer[y][x].width = 1;
+}
+
+static void escribir_celda(int x, int y, const std::string& ch, int w,
+                           unsigned char r, unsigned char g, unsigned char b,
+                           int layer, bool es_capa_texto) {
+    if (y < 1 || y >= HEIGHT - 1 || x < 1 || x + w > WIDTH - 1) return;
+
+    // Impedir que la textura de crayola pise al texto de su misma etapa
+    if (screen_buffer[y][x].colored && screen_buffer[y][x].layer > layer) return;
+    if (w == 2 && screen_buffer[y][x + 1].colored && screen_buffer[y][x + 1].layer > layer) return;
+
+    limpiar_colision_ancha(x, y);
+    if (w == 2) limpiar_colision_ancha(x + 1, y);
+
+    Pixel& cel = screen_buffer[y][x];
+    cel.text            = ch;
+    cel.width           = w;
+    cel.is_continuation = false;
+    cel.r               = r;
+    cel.g               = g;
+    cel.b               = b;
+    cel.colored         = true;
+    cel.flash_white     = es_capa_texto; // SOLO el texto se ilumina en blanco; la crayola entra en color
+    cel.is_text_layer   = es_capa_texto;
+    cel.layer           = layer;
+
+    if (w == 2) {
+        Pixel& next_cel = screen_buffer[y][x + 1];
+        next_cel.text            = "";
+        next_cel.width           = 1;
+        next_cel.is_continuation = true;
+        next_cel.r               = r;
+        next_cel.g               = g;
+        next_cel.b               = b;
+        next_cel.colored         = true;
+        next_cel.flash_white     = es_capa_texto;
+        next_cel.is_text_layer   = es_capa_texto;
+        next_cel.layer           = layer;
+    }
+}
+
+// ============================================================================
+// DEFINICION DE LAS 9 ETAPAS DE LA ROSA
+// ============================================================================
+struct EtapaDef {
+    float cx, cy, ang, rx, ry;
+    int crayon_count; // Trazos de textura de crayola en esta etapa
+    int frases_count; // Frases de floriografia en esta etapa
+    unsigned char r, g, b;
+    bool es_flor;
+    int orden_dir;    // 0: abajo->arriba, 1: der->izq, 2: izq->der, 3: centro->afuera
+};
+
+static const EtapaDef ETAPAS[9] = {
+    // 1 a 4: Tallo en 2 tramos y hojas laterales (Verdes)
+    {50.0f, 32.0f, -90.0f,  6.0f,  1.6f,  26, 18, 0x2e, 0x7d, 0x32, false, 0},
+    {50.0f, 22.0f, -90.0f,  6.0f,  1.6f,  26, 18, 0x2e, 0x7d, 0x32, false, 0},
+    {40.5f, 27.5f,  22.0f,  8.5f,  1.8f,  20, 14, 0x43, 0xa0, 0x47, false, 1},
+    {59.5f, 25.0f, -22.0f,  8.5f,  1.8f,  20, 14, 0x43, 0xa0, 0x47, false, 2},
+
+    // 5 a 9: Capullo, Petalos, Interior y Corazon (Tonos Rojos de la Rosa)
+    {50.0f, 11.5f,   0.0f, 22.0f,  8.0f,  72, 46, 0x7a, 0x00, 0x19, true,  3},
+    {40.0f, 10.5f,  20.0f, 12.5f,  6.5f,  42, 28, 0xa8, 0x00, 0x2a, true,  3},
+    {60.0f, 10.5f, -20.0f, 12.5f,  6.5f,  42, 28, 0xa8, 0x00, 0x2a, true,  3},
+    {50.0f, 11.0f,   0.0f, 10.5f,  5.2f,  32, 20, 0xd8, 0x1b, 0x4a, true,  3},
+    {50.0f, 10.0f,   0.0f,  6.0f,  3.2f,  18, 12, 0xff, 0x3d, 0x68, true,  3}
+};
+
+struct PuntoTrazo {
+    int px, py;
+    float dist_norm;
+};
+
+static bool dentro_de_elipse(int x, int y, const EtapaDef& e, float margen = 1.18f) {
+    float cx = e.cx + OFFSET_X;
+    float cy = e.cy;
+    float rad = -e.ang * 3.14159265f / 180.0f;
+    float dx = (float)x - cx;
+    float dy = (float)y - cy;
+    float lx = dx * std::cos(rad) - dy * std::sin(rad);
+    float ly = dx * std::sin(rad) + dy * std::cos(rad);
+    float norm = (lx / (e.rx * margen)) * (lx / (e.rx * margen)) +
+                 (ly / (e.ry * margen)) * (ly / (e.ry * margen));
+    return norm <= 1.0f;
+}
+
+static std::vector<PuntoTrazo> generar_puntos_etapa(const EtapaDef& e, int cantidad) {
+    std::vector<PuntoTrazo> pts;
+    pts.reserve(cantidad);
+
+    float cx = e.cx + OFFSET_X;
+    float cy = e.cy;
+    float rad = e.ang * 3.14159265f / 180.0f;
+    float cos_a = std::cos(rad);
+    float sin_a = std::sin(rad);
+
+    int intentos = 0;
+    while ((int)pts.size() < cantidad && intentos < cantidad * 12) {
+        intentos++;
+        float u = rand_range(-0.95f, 0.95f);
+        float v = rand_range(-0.95f, 0.95f);
+        float d2 = u * u + v * v;
+        if (d2 > 1.0f) continue;
+
+        float local_x = u * e.rx;
+        float local_y = v * e.ry;
+
+        int px = (int)std::round(cx + local_x * cos_a - local_y * sin_a);
+        int py = (int)std::round(cy + local_x * sin_a + local_y * cos_a);
+
+        if (px >= 2 && px < WIDTH - 2 && py >= 2 && py < HEIGHT - 2) {
+            pts.push_back({px, py, std::sqrt(d2)});
+        }
+    }
+
+    if (e.orden_dir == 0) {
+        std::sort(pts.begin(), pts.end(), [](const PuntoTrazo& a, const PuntoTrazo& b) {
+            return a.py > b.py;
+        });
+    } else if (e.orden_dir == 1) {
+        std::sort(pts.begin(), pts.end(), [](const PuntoTrazo& a, const PuntoTrazo& b) {
+            return a.px > b.px;
+        });
+    } else if (e.orden_dir == 2) {
+        std::sort(pts.begin(), pts.end(), [](const PuntoTrazo& a, const PuntoTrazo& b) {
+            return a.px < b.px;
+        });
+    } else {
+        std::sort(pts.begin(), pts.end(), [](const PuntoTrazo& a, const PuntoTrazo& b) {
+            return a.dist_norm < b.dist_norm;
+        });
+    }
+    return pts;
+}
+
+// ============================================================================
+// PINTAR LOTE (Crayola en color directo vs Texto con destello blanco)
+// ============================================================================
+static void pintar_lote(const std::vector<PuntoTrazo>& pts, int ini, int fin,
+                        int idx_etapa, const EtapaDef& e, bool es_capa_texto) {
+    for (int i = ini; i < fin && i < (int)pts.size(); i++) {
+        const char* cadena = es_capa_texto ? siguiente_frase() : siguiente_crayon();
+        std::vector<Glyph> glifos = separar_glifos_utf8(cadena);
+
+        // Crayola al 55% de brillo en su color; Texto al 100% de brillo
+        float base_brillo = es_capa_texto ? 1.0f : 0.55f;
+        float factor_borde = (pts[i].dist_norm > 0.75f) ? 0.80f : 1.0f;
+        float brillo = base_brillo * factor_borde;
+
+        unsigned char r = (unsigned char)std::min(255.0f, e.r * brillo);
+        unsigned char g = (unsigned char)std::min(255.0f, e.g * brillo);
+        unsigned char b = (unsigned char)std::min(255.0f, e.b * brillo);
+
+        // Jerarquia intercalada por etapa: Crayola = 2*idx, Texto = 2*idx + 1
+        int layer_id = es_capa_texto ? (idx_etapa * 2 + 1) : (idx_etapa * 2);
+
+        if (idx_etapa <= 1) {
+            int x_col = pts[i].px;
+            int y_start = pts[i].py + (int)glifos.size() / 2;
+            for (size_t k = 0; k < glifos.size(); k++) {
+                int y_cur = y_start - (int)k;
+                if (dentro_de_elipse(x_col, y_cur, e, 1.18f)) {
+                    escribir_celda(x_col, y_cur, glifos[k].ch, glifos[k].width,
+                                   r, g, b, layer_id, es_capa_texto);
+                }
+            }
+        } else {
+            int ancho_total = 0;
+            for (const auto& gl : glifos) ancho_total += gl.width;
+
+            int x_cur = pts[i].px - ancho_total / 2;
+            int y_cur = pts[i].py;
+
+            for (const auto& gl : glifos) {
+                if (dentro_de_elipse(x_cur, y_cur, e, 1.22f)) {
+                    escribir_celda(x_cur, y_cur, gl.ch, gl.width,
+                                   r, g, b, layer_id, es_capa_texto);
+                }
+                x_cur += gl.width;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// RENDERIZADO SIN PARPADEO
+// ============================================================================
+static void renderizar_buffer() {
+    std::string out;
+    out.reserve(WIDTH * HEIGHT * 10);
+
+    out += "\033[H";
+
+    for (int y = 0; y < HEIGHT; y++) {
+        int last_x = -1;
+        for (int x = WIDTH - 1; x >= 0; x--) {
+            if (screen_buffer[y][x].colored) {
+                last_x = x;
+                break;
+            }
+        }
+
+        for (int x = 0; x <= last_x; x++) {
+            const Pixel& p = screen_buffer[y][x];
+            if (p.is_continuation) {
+                continue;
+            }
+            if (p.colored) {
+                if (p.flash_white) {
+                    out += "\033[1;38;2;255;255;255m";
+                } else {
+                    char ansi_color[32];
+                    int estilo = p.is_text_layer ? 1 : 22;
+                    std::snprintf(ansi_color, sizeof(ansi_color),
+                                  "\033[%d;38;2;%d;%d;%dm", estilo, p.r, p.g, p.b);
+                    out += ansi_color;
+                }
+                out += p.text;
+            } else {
+                out += "\033[0m ";
+            }
+        }
+        out += "\033[0m\033[K\n";
+    }
+
+    std::cout << out << std::flush;
+}
+
+// ============================================================================
+// MAIN: CONSTRUCCION DE LOS 9 ELEMENTOS INTERCALANDO CRAYOLA Y TEXTO
+// ============================================================================
+int main() {
+    std::cout << "\033[2J\033[H\033[?25l" << std::flush;
+    clear_screen_buffer();
+
+    for (int idx = 0; idx < 9; idx++) {
+        const EtapaDef& etapa = ETAPAS[idx];
+        std::vector<PuntoTrazo> puntos_crayon = generar_puntos_etapa(etapa, etapa.crayon_count);
+        std::vector<PuntoTrazo> puntos_texto  = generar_puntos_etapa(etapa, etapa.frases_count);
+
+        int pasos = etapa.es_flor ? 12 : 6;
+        int lote_c = std::max(1, (int)puntos_crayon.size() / pasos);
+        int lote_t = std::max(1, (int)puntos_texto.size() / pasos);
+
+        for (int p = 0; p < pasos; p++) {
+            // 1. El texto blanco del paso anterior pasa a su color verde o rojo
+            apagar_destellos_previos();
+
+            int ini_c = p * lote_c;
+            int fin_c = (p == pasos - 1) ? (int)puntos_crayon.size() : (p + 1) * lote_c;
+
+            int ini_t = p * lote_t;
+            int fin_t = (p == pasos - 1) ? (int)puntos_texto.size() : (p + 1) * lote_t;
+
+            // 2. Intercalar primero la textura de crayola en verde o rojo (sin blanco)
+            pintar_lote(puntos_crayon, ini_c, fin_c, idx, etapa, false);
+            renderizar_buffer();
+            usleep(etapa.es_flor ? 30000 : 18000);
+
+            // 3. Superponer enseguida el texto floriografico resaltado en BLANCO
+            pintar_lote(puntos_texto, ini_t, fin_t, idx, etapa, true);
+            renderizar_buffer();
+            usleep(etapa.es_flor ? 75000 : 40000);
+        }
+    }
+
+    apagar_destellos_previos();
+    renderizar_buffer();
+
+    std::cout << "\033[?25h" << std::flush;
+    return 0;
+}
